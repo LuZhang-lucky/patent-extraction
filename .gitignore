@@ -1,0 +1,10 @@
+raw_pdfs/
+raw_pdfs2/
+
+results/
+results2/
+results_10/
+
+patent_env/
+
+*.json

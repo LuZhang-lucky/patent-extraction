@@ -1,0 +1,7 @@
+##2026-03-11
+Evaluated 7 Type C patents .
+The results are accuracy high except ansökningsdatum issues.2/7wrong
+
+fine tune the prompt rule for issue “ansökningsdatum” and classification issue
+
+Tested 20 Type C patents.
