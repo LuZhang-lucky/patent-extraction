@@ -4,7 +4,13 @@ raw_pdfs2/
 results/
 results2/
 results_10/
+results_v6_qwen3vl_imageonly/
+
+debug_v5_score_postfix/
+debug_v6_imageonly/
 
 patent_env/
+
+__pycache__/
 
 *.json
