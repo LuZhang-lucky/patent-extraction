@@ -16,9 +16,37 @@ MODEL_NAME = "qwen3-vl:latest"
 
 client = Client(host=OLLAMA_HOST)
 
-PDF_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "PDF100")
-RESULT_DIR = "results_v6_qwen3vl_imageonly"
-DEBUG_DIR = "debug_v6_imageonly"
+def resolve_pdf_dir():
+    env_path = os.getenv("PATENT_PDF_DIR")
+    if env_path:
+        return str(Path(env_path).expanduser())
+
+    home = Path.home()
+    candidates = [
+        home / "Desktop" / "PDF100",
+        Path.cwd() / "PDF100",
+        home / "Desktop" / "PDF5",
+        Path.cwd() / "PDF5",
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    # Fallback when neither candidate exists yet.
+    return str(candidates[0])
+
+
+def resolve_work_dir(env_var, default_name):
+    env_path = os.getenv(env_var)
+    if env_path:
+        return str(Path(env_path).expanduser())
+    return str(Path.cwd() / default_name)
+
+
+PDF_DIR = resolve_pdf_dir()
+RESULT_DIR = resolve_work_dir("PATENT_RESULT_DIR", "results_v6_qwen3vl_imageonly")
+DEBUG_DIR = resolve_work_dir("PATENT_DEBUG_DIR", "debug_v6_qwen3vl_imageonly")
 
 EXPECTED_KEYS = {
     "benamning",
@@ -140,40 +168,31 @@ General rules:
 Field extraction rules:
 
 benamning:
-- Usually appears as the invention title.
-- Often centered and prominent.
-- May appear under "Benamning" or without explicit label.
-- In many historical Swedish patents, the title is unlabeled.
-- Typical position: in the middle/upper-middle of the first page, visually prominent, often between bibliographic header blocks and the body text.
-- If there is one clearly prominent candidate line/phrase matching title style, extract it as benamning.
-- Do not require an explicit "Benamning" label.
+- patent title as a single string.
+- Often unlabeled, so do not require "Benamning" label.
 
 ansokningsnummer:
-- Appears near "Ans.", "Ans. nr", "P.ans.nr", or "inkom den".
+- Appears near "Ans.", "Ans. nr", "P.ans.nr".
 - Extract the number only.
-- Remove label text.
 
 publiceringsnummer:
-- Appears near "PATENT No".
+- Appears after "PATENT No","PATENT"
 - Extract only the number.
 
 prioritetsnummer:
-- Appears near "Prior.", "Prioritetsnummer".
-- Extract only if explicitly stated.
+- Extract priority number only from an explicit priority statement "Prioritet begärd från den"
+- From text like "(Frankrike 39 541)", return prioritetsnummer = "39541".
 
 sokande:
-- Appears under "Sokande", "Innehavare", or "Patenthavare".
-- Extract full text strings (including country if present).
+- applicant/patent holder.
 - Return a list of strings.
 
 uppfinnare:
-- Appears under "Uppfinnare".
 - Extract only if the label "Uppfinnare" appears explicitly.
-- Extract names as full strings.
 - Return a list of strings.
 
 ombud:
-- Appears under "Ombud".
+- Labeled as "Ombud".
 - Extract full text if present.
 
 DPK:
@@ -192,11 +211,11 @@ ansokningsdatum:
 
 beviljatdatum:
 - Grant date.
-- Indicated by "beviljat den".
+- Labeled as "BEVILJAT DEN".
 
 utlaggningsdatum:
 - Public availability date.
-- Indicated by "utlagd den", "utlaggningsdatum".
+- Indicated by "utlagd den",""utlagd och utläggnings"
 
 Date rules:
 - Dates are day-month-year. Normalize to YYYYMMDD.
@@ -464,14 +483,21 @@ def normalize_date_to_yyyymmdd(value):
         return s
 
     # Common numeric patterns: dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy
-    m = re.fullmatch(r"(\d{1,2})[\./-](\d{1,2})[\./-](\d{4})", s)
+    m = re.fullmatch(r"(\d{1,2})\s*[\./-]\s*(\d{1,2})\s*[\./-]\s*(\d{4})", s)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= d <= 31 and 1 <= mo <= 12:
+            return f"{y:04d}{mo:02d}{d:02d}"
+
+    # Mixed separator + space pattern: dd/mm yyyy, dd-mm yyyy, dd.mm yyyy
+    m = re.fullmatch(r"(\d{1,2})\s*[\./-]\s*(\d{1,2})\s+(\d{4})", s)
     if m:
         d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
         if 1 <= d <= 31 and 1 <= mo <= 12:
             return f"{y:04d}{mo:02d}{d:02d}"
 
     # yyyy-mm-dd / yyyy/mm/dd / yyyy.mm.dd
-    m = re.fullmatch(r"(\d{4})[\./-](\d{1,2})[\./-](\d{1,2})", s)
+    m = re.fullmatch(r"(\d{4})\s*[\./-]\s*(\d{1,2})\s*[\./-]\s*(\d{1,2})", s)
     if m:
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
         if 1 <= d <= 31 and 1 <= mo <= 12:
@@ -650,11 +676,25 @@ def looks_like_ipc(value):
     v = re.sub(r"\s+", "", value).upper()
     return re.match(r"^[A-H]\d", v) is not None
 
-def looks_like_klass(value):
+def looks_like_dpk(value):
     if not isinstance(value, str):
         return False
     v = value.strip()
     return re.match(r"^\d", v) is not None
+
+
+def extract_publication_number_int(value):
+    if not isinstance(value, str):
+        return None
+
+    digits = re.sub(r"\D", "", value)
+    if not digits:
+        return None
+
+    try:
+        return int(digits)
+    except ValueError:
+        return None
 
 def apply_classification_postfix(data):
     ipc = data.get("IPC")
@@ -677,8 +717,46 @@ def apply_classification_postfix(data):
         data["IPC"] = None
 
     # If DPK does not look like a Swedish class code, clear it.
-    if dpk is not None and not looks_like_klass(dpk):
+    if dpk is not None and not looks_like_dpk(dpk):
         data["DPK"] = None
+
+    return data
+
+
+def apply_historical_utlaggningsdatum_rule(data):
+    threshold_date = "19631014"
+    threshold_publiceringsnummer = 189481
+
+    utlaggningsdatum = data.get("utlaggningsdatum")
+    if utlaggningsdatum is None:
+        return data
+
+    pub_num = extract_publication_number_int(data.get("publiceringsnummer"))
+
+    # Historical rule: older patents should not have utlaggningsdatum.
+    if pub_num is not None and pub_num < threshold_publiceringsnummer:
+        data["utlaggningsdatum"] = None
+        return data
+
+    if isinstance(utlaggningsdatum, str) and re.fullmatch(r"\d{8}", utlaggningsdatum):
+        if utlaggningsdatum < threshold_date:
+            data["utlaggningsdatum"] = None
+
+    return data
+
+
+def apply_historical_prioritetsnummer_rule(data):
+    threshold_publiceringsnummer = 204780
+
+    prioritetsnummer = data.get("prioritetsnummer")
+    if prioritetsnummer is None:
+        return data
+
+    pub_num = extract_publication_number_int(data.get("publiceringsnummer"))
+
+    # Historical rule: older patents should not have prioritetsnummer.
+    if pub_num is not None and pub_num < threshold_publiceringsnummer:
+        data["prioritetsnummer"] = None
 
     return data
 
@@ -865,6 +943,10 @@ def save_result(filename, parsed_json):
 
     return output_path
 
+
+def get_output_path_for_pdf(filename):
+    return os.path.join(RESULT_DIR, filename.replace(".pdf", ".json"))
+
 # ===== FAILURE TYPE =====
 def classify_error(err_msg):
     msg = err_msg.lower()
@@ -939,6 +1021,8 @@ def process_file(pdf_path):
         log_step(filename, "validate", "ok")
 
         parsed_json = apply_classification_postfix(parsed_json)
+        parsed_json = apply_historical_utlaggningsdatum_rule(parsed_json)
+        parsed_json = apply_historical_prioritetsnummer_rule(parsed_json)
 
         parsed_json["_confidence"] = score_document_full(parsed_json, None, filename)
 
@@ -1002,6 +1086,9 @@ def write_summary(results, path=os.path.join(DEBUG_DIR, "run_summary.csv")):
 def main():
     os.makedirs(RESULT_DIR, exist_ok=True)
 
+    if not os.path.isdir(PDF_DIR):
+        raise FileNotFoundError(f"PDF_DIR does not exist: {PDF_DIR}")
+
     pdf_files = sorted([f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")])
     print(f"Found {len(pdf_files)} PDF files.")
 
@@ -1009,6 +1096,23 @@ def main():
 
     for filename in pdf_files:
         pdf_path = os.path.join(PDF_DIR, filename)
+        output_path = get_output_path_for_pdf(filename)
+
+        if os.path.exists(output_path):
+            print(f"\nSkipping {filename} (already exists)")
+            log_step(filename, "skip", "ok", "output_exists")
+            results.append(
+                {
+                    "file": filename,
+                    "status": "ok",
+                    "stage": "skipped",
+                    "error": None,
+                    "error_type": None,
+                    "output_path": output_path,
+                }
+            )
+            continue
+
         print(f"\nProcessing {filename}")
         result = process_file(pdf_path)
         results.append(result)
